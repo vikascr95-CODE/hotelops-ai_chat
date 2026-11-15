@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HotelOps AI Chat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">H</div><div><b>HotelOps AI</b><small>GUEST CONCIERGE</small></div></div>
+    <button class="new-chat" id="newChat">＋ <span>New conversation</span></button>
+    <div class="side-label">RECENT CHATS</div>
+    <div id="conversationList" class="conversation-list"><div class="muted side-empty">Your conversations will appear here.</div></div>
+    <div class="sidebar-bottom"><div class="status-dot"></div><span>AI receptionist online</span><span class="version">v1.0</span></div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><div><span class="eyebrow">HOTEL GUEST SERVICES</span><h1>Guest Assistant</h1></div><div class="top-right"><span class="online-pill"><i></i> Online</span><div class="avatar">G</div></div></header>
+    <section class="chat-area">
+      <div class="welcome" id="welcome">
+        <div class="hero-icon">✦</div>
+        <div class="eyebrow">YOUR PERSONAL HOTEL ASSISTANT</div>
+        <h2>How can I make your<br><em>stay exceptional?</em></h2>
+        <p>From room service to maintenance, I'm here to help with every part of your stay.</p>
+        <div class="suggestions">
+          <button class="suggestion" data-message="I need two extra towels in my room."><span>♧</span><b>Extra towels</b><small>Request fresh towels</small></button>
+          <button class="suggestion" data-message="The air conditioning in my room is not working."><span>❄</span><b>Room maintenance</b><small>Report an issue</small></button>
+          <button class="suggestion" data-message="Can I see the room service options?"><span>♨</span><b>Room service</b><small>Food and beverages</small></button>
+          <button class="suggestion" data-message="What time is check-out?"><span>◷</span><b>Hotel information</b><small>Ask a quick question</small></button>
+        </div>
+      </div>
+      <div class="messages" id="messages"></div>
+    </section>
+    <footer class="composer-wrap">
+      <div class="guest-fields"><input id="guestName" placeholder="Guest name (optional)"><input id="roomNumber" placeholder="Room number (optional)"></div>
+      <form id="chatForm" class="composer"><textarea id="messageInput" rows="1" placeholder="Type your message..." required maxlength="4000"></textarea><button id="sendButton" type="submit" aria-label="Send message">➤</button></form>
+      <div class="disclaimer">HotelOps AI can make mistakes. Important requests are routed to hotel staff for confirmation.</div>
+    </footer>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body></html>
