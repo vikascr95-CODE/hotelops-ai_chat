@@ -1,0 +1,270 @@
+import json
+import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+DB_PATH = BASE_DIR / "hotelops_chat.db"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+
+app = FastAPI(title="HotelOps AI Chat", version="1.0.0")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
+DEPARTMENTS = [
+    "Housekeeping", "Maintenance", "Reservations", "Room Service",
+    "Front Office", "Concierge", "Accounts", "Security", "Other"
+]
+PRIORITIES = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string"},
+        "needs_human": {"type": "boolean"},
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "department": {"type": "string", "enum": DEPARTMENTS},
+                    "room_number": {"type": ["string", "null"]},
+                    "priority": {"type": "string", "enum": PRIORITIES}
+                },
+                "required": ["title", "description", "department", "room_number", "priority"],
+                "additionalProperties": False
+            }
+        }
+    },
+    "required": ["reply", "needs_human", "tasks"],
+    "additionalProperties": False
+}
+
+SYSTEM_PROMPT = """
+You are HotelOps AI, a courteous hotel receptionist and operations assistant.
+Understand the guest's message and respond naturally.
+Create one separate task for EACH actionable request. A message can create multiple tasks
+for different departments. Do not create a task for a question that needs only an answer.
+Departments: Housekeeping, Maintenance, Reservations, Room Service, Front Office,
+Concierge, Accounts, Security, Other.
+Priorities: LOW, MEDIUM, HIGH, CRITICAL. Use CRITICAL only for immediate safety or
+serious emergencies; never claim emergency services have been contacted.
+Extract a room number only when explicitly provided. If key details are missing, ask
+a concise follow-up and do not invent them. Do not invent hotel policies, prices,
+availability, booking changes, refunds, or completed work.
+For financial actions, cancellations with financial impact, sensitive guest changes,
+and security/emergency matters, set needs_human=true and explain that staff must review.
+Task creation means a request has been recorded, NOT that the department has completed it.
+Return only the required structured data.
+"""
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    conversation_id: str | None = None
+    guest_name: str | None = Field(default=None, max_length=120)
+    room_number: str | None = Field(default=None, max_length=30)
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY, guest_name TEXT, room_number TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+            title TEXT NOT NULL, description TEXT NOT NULL,
+            department TEXT NOT NULL, room_number TEXT,
+            priority TEXT NOT NULL, status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+        );
+        """)
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+@app.get("/")
+def home():
+    return FileResponse(BASE_DIR / "static" / "index.html")
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "ai_configured": client is not None}
+
+def fallback_understanding(message: str, room_number: str | None) -> dict[str, Any]:
+    """Keyword fallback keeps local demo usable; it is not a substitute for the AI model."""
+    lower = message.lower()
+    tasks = []
+    rules = [
+        (["towel", "towels", "linen", "pillow", "blanket", "clean", "housekeeping"], "Housekeeping", "Guest requested housekeeping assistance"),
+        (["ac", "air conditioner", "plumbing", "leak", "light", "tv", "wifi", "broken", "not working"], "Maintenance", "Guest reported a maintenance issue"),
+        (["food", "order", "meal", "water", "room service"], "Room Service", "Guest requested room service"),
+        (["book", "reservation", "check in", "check-in", "checkout", "check-out"], "Reservations", "Guest has a reservation-related request"),
+        (["taxi", "cab", "airport", "tour", "restaurant nearby"], "Concierge", "Guest requested concierge assistance"),
+        (["bill", "invoice", "refund", "payment"], "Accounts", "Guest has an accounts-related request"),
+        (["security", "unsafe", "theft", "emergency", "fire"], "Security", "Guest reported a security or safety concern"),
+    ]
+    for keywords, dept, default_title in rules:
+        if any(k in lower for k in keywords):
+            title = message.strip()[:100] if len(message.strip()) < 100 else default_title
+            priority = "CRITICAL" if any(k in lower for k in ["fire", "emergency", "unsafe"]) else "MEDIUM"
+            tasks.append({
+                "title": title, "description": message, "department": dept,
+                "room_number": room_number, "priority": priority
+            })
+    if tasks:
+        reply = f"I've identified {len(tasks)} request(s) and recorded them for the relevant teams. Staff will need to review and action them."
+    else:
+        reply = "Hello! I'm the HotelOps AI receptionist. How can I help with your stay today?"
+    return {"reply": reply, "needs_human": any(t["department"] in ["Accounts", "Security"] for t in tasks), "tasks": tasks}
+
+def ask_ai(message: str, history: list[dict], room_number: str | None) -> dict[str, Any]:
+    if client is None:
+        return fallback_understanding(message, room_number)
+    context = []
+    for item in history[-12:]:
+        context.append({"role": item["role"], "content": item["content"]})
+    context.append({"role": "user", "content": message})
+    try:
+        response = client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM_PROMPT + (f"\nVerified room number supplied by guest: {room_number}." if room_number else ""),
+            input=context,
+            text={"format": {"type": "json_schema", "name": "hotelops_chat_result", "strict": True, "schema": SCHEMA}},
+        )
+        data = json.loads(response.output_text)
+        if not isinstance(data.get("tasks"), list) or not isinstance(data.get("reply"), str):
+            raise ValueError("Unexpected AI response format")
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"AI service error. Check your API key, model access and connection. ({type(exc).__name__})")
+
+@app.post("/api/chat")
+def chat(payload: ChatRequest):
+    message = payload.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    conversation_id = payload.conversation_id or str(uuid.uuid4())
+    with db() as conn:
+        existing = conn.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        if existing is None:
+            conn.execute(
+                "INSERT INTO conversations(id,guest_name,room_number,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (conversation_id, payload.guest_name, payload.room_number, now_iso(), now_iso())
+            )
+        else:
+            payload.room_number = payload.room_number or existing["room_number"]
+            payload.guest_name = payload.guest_name or existing["guest_name"]
+            conn.execute("UPDATE conversations SET guest_name=?, room_number=?, updated_at=? WHERE id=?",
+                         (payload.guest_name, payload.room_number, now_iso(), conversation_id))
+        history = [dict(r) for r in conn.execute(
+            "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 12",
+            (conversation_id,)
+        ).fetchall()][::-1]
+
+    result = ask_ai(message, history, payload.room_number)
+    created_tasks = []
+    with db() as conn:
+        conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
+                     (conversation_id, "user", message, now_iso()))
+        for task in result["tasks"]:
+            dept = task.get("department")
+            if dept not in DEPARTMENTS:
+                continue
+            priority = task.get("priority")
+            if priority not in PRIORITIES:
+                priority = "MEDIUM"
+            task_id = "HOT-" + uuid.uuid4().hex[:8].upper()
+            room = task.get("room_number") or payload.room_number
+            conn.execute("""INSERT INTO tasks
+                (id,conversation_id,title,description,department,room_number,priority,status,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (task_id, conversation_id, task["title"][:160], task["description"][:1000],
+                 dept, room, priority, "PENDING", now_iso()))
+            created_tasks.append({
+                "id": task_id, "title": task["title"], "department": dept,
+                "room_number": room, "priority": priority, "status": "PENDING"
+            })
+        reply = result["reply"]
+        if created_tasks:
+            reply += "\n\nRequest ID(s): " + ", ".join(t["id"] for t in created_tasks)
+        if result.get("needs_human"):
+            reply += "\n\nA staff member must review this request before any sensitive action is taken."
+        conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
+                     (conversation_id, "assistant", reply, now_iso()))
+        conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now_iso(), conversation_id))
+
+    return {"conversation_id": conversation_id, "reply": reply, "tasks": created_tasks,
+            "ai_mode": "openai" if client else "demo-fallback"}
+
+@app.get("/api/conversations")
+def conversations():
+    with db() as conn:
+        rows = conn.execute("""SELECT c.id,c.guest_name,c.room_number,c.updated_at,
+            (SELECT content FROM messages m WHERE m.conversation_id=c.id ORDER BY id DESC LIMIT 1) last_message
+            FROM conversations c ORDER BY c.updated_at DESC LIMIT 50""").fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/api/conversations/{conversation_id}/messages")
+def conversation_messages(conversation_id: str):
+    with db() as conn:
+        exists = conn.execute("SELECT id FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        rows = conn.execute("SELECT role,content,created_at FROM messages WHERE conversation_id=? ORDER BY id",
+                            (conversation_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+@app.get("/api/tasks")
+def tasks(status: str | None = None, department: str | None = None):
+    query = "SELECT * FROM tasks WHERE 1=1"
+    args = []
+    if status:
+        query += " AND status=?"; args.append(status.upper())
+    if department:
+        query += " AND department=?"; args.append(department)
+    query += " ORDER BY created_at DESC LIMIT 200"
+    with db() as conn:
+        rows = conn.execute(query, args).fetchall()
+    return [dict(r) for r in rows]
+
+@app.patch("/api/tasks/{task_id}/status")
+def update_task_status(task_id: str, payload: dict):
+    allowed = {"PENDING", "ASSIGNED", "IN_PROGRESS", "COMPLETED", "CANCELLED", "ESCALATED"}
+    status = str(payload.get("status", "")).upper()
+    if status not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid task status.")
+    with db() as conn:
+        cur = conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Task not found.")
+    return {"id": task_id, "status": status}
