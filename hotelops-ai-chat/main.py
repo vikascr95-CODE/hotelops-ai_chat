@@ -19,35 +19,29 @@ DB_PATH = BASE_DIR / "hotelops_chat.db"
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
 
-app = FastAPI(title="HotelOps AI Chat", version="1.0.0")
+app = FastAPI(title="HotelOps AI", version="1.1.0", description="AI guest concierge and hotel staff operations")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
-DEPARTMENTS = [
-    "Housekeeping", "Maintenance", "Reservations", "Room Service",
-    "Front Office", "Concierge", "Accounts", "Security", "Other"
-]
+DEPARTMENTS = ["Housekeeping", "Maintenance", "Reservations", "Room Service", "Front Office", "Concierge", "Accounts", "Security", "Other"]
 PRIORITIES = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+STATUSES = ["PENDING", "ASSIGNED", "IN_PROGRESS", "COMPLETED", "CANCELLED", "ESCALATED"]
 
 SCHEMA = {
     "type": "object",
     "properties": {
         "reply": {"type": "string"},
         "needs_human": {"type": "boolean"},
-        "tasks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
-                    "department": {"type": "string", "enum": DEPARTMENTS},
-                    "room_number": {"type": ["string", "null"]},
-                    "priority": {"type": "string", "enum": PRIORITIES}
-                },
-                "required": ["title", "description", "department", "room_number", "priority"],
-                "additionalProperties": False
-            }
-        }
+        "tasks": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"}, "description": {"type": "string"},
+                "department": {"type": "string", "enum": DEPARTMENTS},
+                "room_number": {"type": ["string", "null"]},
+                "priority": {"type": "string", "enum": PRIORITIES}
+            },
+            "required": ["title", "description", "department", "room_number", "priority"],
+            "additionalProperties": False
+        }}
     },
     "required": ["reply", "needs_human", "tasks"],
     "additionalProperties": False
@@ -106,6 +100,13 @@ def init_db():
             FOREIGN KEY(conversation_id) REFERENCES conversations(id)
         );
         """)
+        # Safe, repeatable migration for databases created by earlier versions.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "updated_at" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT")
+            conn.execute("UPDATE tasks SET updated_at=created_at WHERE updated_at IS NULL")
+        if "assigned_to" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN assigned_to TEXT")
 
 @app.on_event("startup")
 def startup():
@@ -115,12 +116,15 @@ def startup():
 def home():
     return FileResponse(BASE_DIR / "static" / "index.html")
 
+@app.get("/staff")
+def staff_dashboard():
+    return FileResponse(BASE_DIR / "static" / "staff.html")
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "ai_configured": client is not None}
+    return {"status": "ok", "ai_configured": client is not None, "version": app.version}
 
 def fallback_understanding(message: str, room_number: str | None) -> dict[str, Any]:
-    """Keyword fallback keeps local demo usable; it is not a substitute for the AI model."""
     lower = message.lower()
     tasks = []
     rules = [
@@ -136,22 +140,15 @@ def fallback_understanding(message: str, room_number: str | None) -> dict[str, A
         if any(k in lower for k in keywords):
             title = message.strip()[:100] if len(message.strip()) < 100 else default_title
             priority = "CRITICAL" if any(k in lower for k in ["fire", "emergency", "unsafe"]) else "MEDIUM"
-            tasks.append({
-                "title": title, "description": message, "department": dept,
-                "room_number": room_number, "priority": priority
-            })
-    if tasks:
-        reply = f"I've identified {len(tasks)} request(s) and recorded them for the relevant teams. Staff will need to review and action them."
-    else:
-        reply = "Hello! I'm the HotelOps AI receptionist. How can I help with your stay today?"
+            tasks.append({"title": title, "description": message, "department": dept, "room_number": room_number, "priority": priority})
+    reply = (f"I've identified {len(tasks)} request(s) and recorded them for the relevant teams. Staff will need to review and action them."
+             if tasks else "Hello! I'm the HotelOps AI receptionist. How can I help with your stay today?")
     return {"reply": reply, "needs_human": any(t["department"] in ["Accounts", "Security"] for t in tasks), "tasks": tasks}
 
 def ask_ai(message: str, history: list[dict], room_number: str | None) -> dict[str, Any]:
     if client is None:
         return fallback_understanding(message, room_number)
-    context = []
-    for item in history[-12:]:
-        context.append({"role": item["role"], "content": item["content"]})
+    context = [{"role": item["role"], "content": item["content"]} for item in history[-12:]]
     context.append({"role": "user", "content": message})
     try:
         response = client.responses.create(
@@ -172,25 +169,20 @@ def chat(payload: ChatRequest):
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
-
     conversation_id = payload.conversation_id or str(uuid.uuid4())
     with db() as conn:
         existing = conn.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
         if existing is None:
-            conn.execute(
-                "INSERT INTO conversations(id,guest_name,room_number,created_at,updated_at) VALUES(?,?,?,?,?)",
-                (conversation_id, payload.guest_name, payload.room_number, now_iso(), now_iso())
-            )
+            conn.execute("INSERT INTO conversations(id,guest_name,room_number,created_at,updated_at) VALUES(?,?,?,?,?)",
+                         (conversation_id, payload.guest_name, payload.room_number, now_iso(), now_iso()))
         else:
             payload.room_number = payload.room_number or existing["room_number"]
             payload.guest_name = payload.guest_name or existing["guest_name"]
             conn.execute("UPDATE conversations SET guest_name=?, room_number=?, updated_at=? WHERE id=?",
                          (payload.guest_name, payload.room_number, now_iso(), conversation_id))
         history = [dict(r) for r in conn.execute(
-            "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 12",
-            (conversation_id,)
+            "SELECT role,content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 12", (conversation_id,)
         ).fetchall()][::-1]
-
     result = ask_ai(message, history, payload.room_number)
     created_tasks = []
     with db() as conn:
@@ -200,20 +192,17 @@ def chat(payload: ChatRequest):
             dept = task.get("department")
             if dept not in DEPARTMENTS:
                 continue
-            priority = task.get("priority")
-            if priority not in PRIORITIES:
-                priority = "MEDIUM"
+            priority = task.get("priority") if task.get("priority") in PRIORITIES else "MEDIUM"
             task_id = "HOT-" + uuid.uuid4().hex[:8].upper()
             room = task.get("room_number") or payload.room_number
+            stamp = now_iso()
             conn.execute("""INSERT INTO tasks
-                (id,conversation_id,title,description,department,room_number,priority,status,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (id,conversation_id,title,description,department,room_number,priority,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (task_id, conversation_id, task["title"][:160], task["description"][:1000],
-                 dept, room, priority, "PENDING", now_iso()))
-            created_tasks.append({
-                "id": task_id, "title": task["title"], "department": dept,
-                "room_number": room, "priority": priority, "status": "PENDING"
-            })
+                 dept, room, priority, "PENDING", stamp, stamp))
+            created_tasks.append({"id": task_id, "title": task["title"], "department": dept,
+                                  "room_number": room, "priority": priority, "status": "PENDING"})
         reply = result["reply"]
         if created_tasks:
             reply += "\n\nRequest ID(s): " + ", ".join(t["id"] for t in created_tasks)
@@ -222,7 +211,6 @@ def chat(payload: ChatRequest):
         conn.execute("INSERT INTO messages(conversation_id,role,content,created_at) VALUES(?,?,?,?)",
                      (conversation_id, "assistant", reply, now_iso()))
         conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now_iso(), conversation_id))
-
     return {"conversation_id": conversation_id, "reply": reply, "tasks": created_tasks,
             "ai_mode": "openai" if client else "demo-fallback"}
 
@@ -231,7 +219,7 @@ def conversations():
     with db() as conn:
         rows = conn.execute("""SELECT c.id,c.guest_name,c.room_number,c.updated_at,
             (SELECT content FROM messages m WHERE m.conversation_id=c.id ORDER BY id DESC LIMIT 1) last_message
-            FROM conversations c ORDER BY c.updated_at DESC LIMIT 50""").fetchall()
+            FROM conversations c ORDER BY c.updated_at DESC LIMIT 100""").fetchall()
     return [dict(r) for r in rows]
 
 @app.get("/api/conversations/{conversation_id}/messages")
@@ -245,26 +233,57 @@ def conversation_messages(conversation_id: str):
     return [dict(r) for r in rows]
 
 @app.get("/api/tasks")
-def tasks(status: str | None = None, department: str | None = None):
+def tasks(status: str | None = None, department: str | None = None,
+          priority: str | None = None, search: str | None = None):
     query = "SELECT * FROM tasks WHERE 1=1"
-    args = []
-    if status:
+    args: list[Any] = []
+    if status and status.upper() in STATUSES:
         query += " AND status=?"; args.append(status.upper())
-    if department:
+    if department and department in DEPARTMENTS:
         query += " AND department=?"; args.append(department)
-    query += " ORDER BY created_at DESC LIMIT 200"
+    if priority and priority.upper() in PRIORITIES:
+        query += " AND priority=?"; args.append(priority.upper())
+    if search:
+        term = f"%{search.strip()}%"
+        query += " AND (id LIKE ? OR title LIKE ? OR description LIKE ? OR room_number LIKE ?)"
+        args.extend([term, term, term, term])
+    query += " ORDER BY CASE priority WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 3 ELSE 4 END, created_at DESC LIMIT 500"
     with db() as conn:
         rows = conn.execute(query, args).fetchall()
     return [dict(r) for r in rows]
 
+@app.get("/api/dashboard/summary")
+def dashboard_summary():
+    with db() as conn:
+        rows = conn.execute("SELECT status, COUNT(*) count FROM tasks GROUP BY status").fetchall()
+        by_department = conn.execute("SELECT department, COUNT(*) count FROM tasks GROUP BY department ORDER BY count DESC").fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        recent = conn.execute("SELECT id,title,department,room_number,priority,status,created_at FROM tasks ORDER BY created_at DESC LIMIT 6").fetchall()
+    counts = {status: 0 for status in STATUSES}
+    counts.update({row["status"]: row["count"] for row in rows})
+    return {"total": total, "pending": counts["PENDING"], "assigned": counts["ASSIGNED"],
+            "in_progress": counts["IN_PROGRESS"], "completed": counts["COMPLETED"],
+            "escalated": counts["ESCALATED"], "cancelled": counts["CANCELLED"],
+            "by_department": [dict(r) for r in by_department], "recent": [dict(r) for r in recent]}
+
 @app.patch("/api/tasks/{task_id}/status")
 def update_task_status(task_id: str, payload: dict):
-    allowed = {"PENDING", "ASSIGNED", "IN_PROGRESS", "COMPLETED", "CANCELLED", "ESCALATED"}
     status = str(payload.get("status", "")).upper()
-    if status not in allowed:
-        raise HTTPException(status_code=400, detail="Invalid task status.")
+    if status not in STATUSES:
+        raise HTTPException(status_code=400, detail=f"Status must be one of: {', '.join(STATUSES)}")
     with db() as conn:
-        cur = conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+        cur = conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=?", (status, now_iso(), task_id))
         if cur.rowcount == 0:
             raise HTTPException(status_code=404, detail="Task not found.")
-    return {"id": task_id, "status": status}
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row)
+
+@app.patch("/api/tasks/{task_id}/assignment")
+def assign_task(task_id: str, payload: dict):
+    assignee = str(payload.get("assigned_to", "")).strip()[:120] or None
+    with db() as conn:
+        cur = conn.execute("UPDATE tasks SET assigned_to=?, updated_at=? WHERE id=?", (assignee, now_iso(), task_id))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row)
